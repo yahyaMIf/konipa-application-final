@@ -1,0 +1,300 @@
+# Docker Compose pour Sage 100c Commercial Premium - Version Maroc
+# Configuration spécifique pour l'intégration avec Konipa Platform
+
+version: '3.8'
+
+services:
+  # Application Konipa avec intégration Sage Maroc
+  konipa-sage-maroc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: konipa-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Configuration Node.js
+      - NODE_ENV=production
+      - PORT=3000
+      
+      # Configuration Base de données
+      - DB_HOST=mysql-sage
+      - DB_PORT=3306
+      - DB_NAME=konipa_sage_maroc
+      - DB_USER=konipa_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      
+      # Configuration Redis
+      - REDIS_HOST=redis-sage
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      
+      # Configuration Sage 100c Maroc
+      - SAGE_SERVER=${SAGE_SERVER}
+      - SAGE_DATABASE=${SAGE_DATABASE}
+      - SAGE_USERNAME=${SAGE_USERNAME}
+      - SAGE_PASSWORD=${SAGE_PASSWORD}
+      - SAGE_WS_URL=${SAGE_WS_URL}
+      
+      # Configuration spécifique Maroc
+      - SAGE_COUNTRY=MA
+      - SAGE_LANGUAGE=FR
+      - SAGE_CURRENCY=MAD
+      - SAGE_TIMEZONE=Africa/Casablanca
+      - SAGE_TAX_STANDARD=20
+      - SAGE_TAX_REDUCED=10
+      
+      # Configuration JWT
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRES_IN=24h
+      
+      # Configuration Logs
+      - LOG_LEVEL=info
+      - LOG_FORMAT=json
+      
+      # Configuration Performance
+      - CACHE_TTL=3600
+      - RATE_LIMIT_WINDOW=900000
+      - RATE_LIMIT_MAX=100
+      
+      # Configuration Monitoring
+      - ENABLE_METRICS=true
+      - METRICS_PORT=9090
+      
+    volumes:
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+      - ./backups:/app/backups
+    networks:
+      - sage-maroc-network
+    depends_on:
+      - mysql-sage
+      - redis-sage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/sage/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Base de données MySQL pour Konipa + Sage
+  mysql-sage:
+    image: mysql:8.0
+    container_name: mysql-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=konipa_sage_maroc
+      - MYSQL_USER=konipa_user
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_CHARACTER_SET_SERVER=utf8mb4
+      - MYSQL_COLLATION_SERVER=utf8mb4_unicode_ci
+    volumes:
+      - mysql_sage_data:/var/lib/mysql
+      - ./database/init:/docker-entrypoint-initdb.d
+      - ./database/backups:/backups
+    networks:
+      - sage-maroc-network
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --sql-mode=STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO
+      --max-connections=200
+      --innodb-buffer-pool-size=256M
+      --query-cache-size=64M
+      --tmp-table-size=64M
+      --max-heap-table-size=64M
+
+  # Cache Redis pour optimisation
+  redis-sage:
+    image: redis:7-alpine
+    container_name: redis-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    volumes:
+      - redis_sage_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - sage-maroc-network
+    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+
+  # Reverse Proxy Nginx
+  nginx-sage:
+    image: nginx:alpine
+    container_name: nginx-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/logs:/var/log/nginx
+    networks:
+      - sage-maroc-network
+    depends_on:
+      - konipa-sage-maroc
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Worker pour tâches asynchrones
+  sage-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: sage-worker-maroc
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - WORKER_MODE=true
+      - DB_HOST=mysql-sage
+      - DB_PORT=3306
+      - DB_NAME=konipa_sage_maroc
+      - DB_USER=konipa_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_HOST=redis-sage
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - SAGE_SERVER=${SAGE_SERVER}
+      - SAGE_DATABASE=${SAGE_DATABASE}
+      - SAGE_USERNAME=${SAGE_USERNAME}
+      - SAGE_PASSWORD=${SAGE_PASSWORD}
+      - SAGE_WS_URL=${SAGE_WS_URL}
+      - LOG_LEVEL=info
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - sage-maroc-network
+    depends_on:
+      - mysql-sage
+      - redis-sage
+    command: npm run worker
+
+  # Monitoring avec Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - sage-maroc-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+
+  # Visualisation avec Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - sage-maroc-network
+    depends_on:
+      - prometheus
+
+  # Collecteur de logs Fluentd
+  fluentd:
+    build:
+      context: ./logging
+      dockerfile: Dockerfile.fluentd
+    container_name: fluentd-sage-maroc
+    restart: unless-stopped
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    volumes:
+      - ./logging/fluent.conf:/fluentd/etc/fluent.conf
+      - ./logs:/fluentd/log
+    networks:
+      - sage-maroc-network
+    environment:
+      - FLUENTD_CONF=fluent.conf
+
+  # Backup automatique
+  backup-service:
+    image: alpine:latest
+    container_name: backup-sage-maroc
+    restart: unless-stopped
+    volumes:
+      - mysql_sage_data:/data/mysql
+      - redis_sage_data:/data/redis
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh
+    networks:
+      - sage-maroc-network
+    environment:
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-0 2 * * *}
+      - MYSQL_HOST=mysql-sage
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=konipa_sage_maroc
+    command: >
+      sh -c '
+        apk add --no-cache mysql-client redis dcron &&
+        echo "${BACKUP_SCHEDULE} /backup.sh" | crontab - &&
+        crond -f
+      '
+
+networks:
+  sage-maroc-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  mysql_sage_data:
+    driver: local
+  redis_sage_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# Configuration des secrets (à utiliser avec Docker Swarm)
+secrets:
+  db_password:
+    external: true
+  redis_password:
+    external: true
+  jwt_secret:
+    external: true
+  sage_password:
+    external: true

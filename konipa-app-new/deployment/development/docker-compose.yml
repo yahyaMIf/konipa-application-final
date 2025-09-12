@@ -1,0 +1,204 @@
+# Docker Compose pour Konipa B2B - Version Refonte
+# Base de données unifiée MySQL + Redis
+# Mocks désactivés, API backend réelle
+
+# Docker Compose pour Konipa Platform - Développement Local
+# Configuration optimisée pour Docker Desktop
+
+services:
+  # Base de données MySQL
+  konipa-db:
+    image: mysql:8.0
+    container_name: konipa-mysql-dev
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: konipa_dev
+      MYSQL_USER: konipa_user
+      MYSQL_PASSWORD: konipa123
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    volumes:
+      # Données persistantes avec volume nommé pour Docker Desktop
+      - konipa_mysql_data:/var/lib/mysql
+      # Scripts d'initialisation
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+      # Configuration MySQL personnalisée
+      - ./database/mysql.conf:/etc/mysql/conf.d/custom.cnf:ro
+    networks:
+      - konipa-network
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --sql-mode=STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO
+      --max-connections=100
+      --innodb-buffer-pool-size=128M
+      --tmp-table-size=32M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot123"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Cache Redis
+  konipa-redis:
+    image: redis:7-alpine
+    container_name: konipa-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      # Données persistantes
+      - konipa_redis_data:/data
+      # Configuration Redis
+      - ./database/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - konipa-network
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Application Backend Node.js
+  konipa-backend:
+    build:
+      context: ./konipa-app-new/backend
+      dockerfile: Dockerfile.dev
+    container_name: konipa-backend-dev
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+      - "9229:9229" # Port pour le debugging Node.js
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      
+      # Configuration Base de données
+      DB_HOST: konipa-db
+      DB_PORT: 3306
+      DB_NAME: konipa_dev
+      DB_USER: konipa_user
+      DB_PASSWORD: konipa123
+      
+      # Configuration Redis
+      REDIS_HOST: konipa-redis
+      REDIS_PORT: 6379
+      
+      # Configuration JWT
+      JWT_SECRET: dev-secret-key-change-in-production
+      JWT_EXPIRES_IN: 24h
+      
+      # Configuration de développement
+      DEBUG: konipa:*
+      LOG_LEVEL: debug
+      
+      # Hot reload
+      CHOKIDAR_USEPOLLING: true
+      WATCHPACK_POLLING: true
+    volumes:
+      # Code source pour hot reload
+      - ./konipa-app-new/backend:/app
+      - /app/node_modules
+      # Logs
+      - ./konipa-app-new/logs:/app/logs
+      # Uploads
+      - ./konipa-app-new/uploads:/app/uploads
+    networks:
+      - konipa-network
+    depends_on:
+      konipa-db:
+        condition: service_healthy
+      konipa-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Application Frontend React
+  konipa-frontend:
+    build:
+      context: ./konipa-app-new
+      dockerfile: frontend/Dockerfile.dev
+    container_name: konipa-frontend-dev
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      NODE_ENV: development
+      VITE_API_URL: http://localhost:3001
+      VITE_APP_NAME: Konipa Platform Dev
+      
+      # Hot reload
+      CHOKIDAR_USEPOLLING: true
+      WATCHPACK_POLLING: true
+    volumes:
+      # Code source pour hot reload
+      - ./konipa-app-new:/app
+      - /app/node_modules
+    networks:
+      - konipa-network
+    depends_on:
+      - konipa-backend
+    stdin_open: true
+    tty: true
+
+  # Adminer pour la gestion de base de données
+  konipa-adminer:
+    image: adminer:4.8.1
+    container_name: konipa-adminer-dev
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: konipa-db
+      ADMINER_DESIGN: pepa-linha
+    networks:
+      - konipa-network
+    depends_on:
+      - konipa-db
+
+  # Redis Commander pour la gestion du cache
+  konipa-redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: konipa-redis-commander-dev
+    restart: unless-stopped
+    ports:
+      - "8082:8081"
+    environment:
+      REDIS_HOSTS: local:konipa-redis:6379
+      HTTP_USER: admin
+      HTTP_PASSWORD: admin123
+    networks:
+      - konipa-network
+    depends_on:
+      - konipa-redis
+
+# Réseaux
+networks:
+  konipa-network:
+    driver: bridge
+    name: konipa-dev-network
+
+# Volumes persistants optimisés pour Docker Desktop
+volumes:
+  konipa_mysql_data:
+    driver: local
+    name: konipa_mysql_data
+  konipa_redis_data:
+    driver: local
+    name: konipa_redis_data
+
+# Configuration des profils pour un démarrage sélectif
+# Utilisation :
+# docker-compose up                          # Services de base (DB + Backend + Frontend)
+# docker-compose --profile tools up          # Avec outils de gestion (Adminer + Redis Commander)
+# docker-compose --profile all up            # Tous les services

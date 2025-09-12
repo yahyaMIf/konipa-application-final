@@ -1,0 +1,311 @@
+# Docker Compose pour l'intégration Sage 100c avec Konipa
+# Ce fichier configure l'environnement de développement et production
+
+version: '3.8'
+
+services:
+  # Application Konipa avec intégration Sage
+  konipa-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: konipa-sage-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Configuration Node.js
+      - NODE_ENV=production
+      - PORT=3000
+      
+      # Configuration base de données
+      - DB_HOST=konipa-db
+      - DB_PORT=3306
+      - DB_NAME=konipa_production
+      - DB_USER=konipa_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      
+      # Configuration JWT
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRES_IN=24h
+      
+      # Configuration Sage 100c
+      - SAGE_API_BASE_URL=${SAGE_API_BASE_URL}
+      - SAGE_API_KEY=${SAGE_API_KEY}
+      - SAGE_COMPANY_ID=${SAGE_COMPANY_ID}
+      - SAGE_DATABASE_NAME=${SAGE_DATABASE_NAME}
+      - SAGE_USERNAME=${SAGE_USERNAME}
+      - SAGE_PASSWORD=${SAGE_PASSWORD}
+      
+      # Configuration SSL Sage
+      - SAGE_SSL_ENABLED=true
+      - SAGE_SSL_CERT_PATH=/app/certs/sage-cert.pem
+      - SAGE_SSL_KEY_PATH=/app/certs/sage-key.pem
+      - SAGE_SSL_CA_PATH=/app/certs/sage-ca.pem
+      
+      # Configuration cache
+      - SAGE_CACHE_TTL=300
+      - SAGE_CACHE_MAX_SIZE=1000
+      - REDIS_URL=redis://konipa-redis:6379
+      
+      # Configuration synchronisation
+      - SAGE_SYNC_INTERVAL=3600
+      - SAGE_SYNC_BATCH_SIZE=100
+      - SAGE_SYNC_ENABLED=true
+      
+      # Configuration logging
+      - SAGE_LOG_LEVEL=info
+      - SAGE_LOG_FILE=/app/logs/sage-integration.log
+      
+      # Configuration monitoring
+      - MONITORING_ENABLED=true
+      - METRICS_PORT=9090
+      
+    volumes:
+      # Logs persistants
+      - ./logs:/app/logs
+      # Certificats SSL
+      - ./certs:/app/certs:ro
+      # Configuration personnalisée
+      - ./config:/app/config:ro
+      # Uploads temporaires
+      - ./uploads:/app/uploads
+      
+    depends_on:
+      - konipa-db
+      - konipa-redis
+      
+    networks:
+      - konipa-network
+      - sage-network
+      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Base de données MySQL
+  konipa-db:
+    image: mysql:8.0
+    container_name: konipa-sage-db
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MYSQL_DATABASE=konipa_production
+      - MYSQL_USER=konipa_user
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_CHARACTER_SET_SERVER=utf8mb4
+      - MYSQL_COLLATION_SERVER=utf8mb4_unicode_ci
+    volumes:
+      # Données persistantes
+      - konipa-db-data:/var/lib/mysql
+      # Scripts d'initialisation
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+      # Configuration MySQL
+      - ./database/config/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+    networks:
+      - konipa-network
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Cache Redis
+  konipa-redis:
+    image: redis:7-alpine
+    container_name: konipa-sage-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - konipa-redis-data:/data
+      - ./redis/config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - konipa-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Reverse Proxy
+  konipa-nginx:
+    image: nginx:alpine
+    container_name: konipa-sage-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Configuration Nginx
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # Certificats SSL
+      - ./certs:/etc/nginx/certs:ro
+      # Logs Nginx
+      - ./logs/nginx:/var/log/nginx
+      # Fichiers statiques
+      - ./public:/var/www/html:ro
+    depends_on:
+      - konipa-app
+    networks:
+      - konipa-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Monitoring avec Prometheus
+  konipa-prometheus:
+    image: prom/prometheus:latest
+    container_name: konipa-sage-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - konipa-prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - konipa-network
+    profiles:
+      - monitoring
+
+  # Visualisation avec Grafana
+  konipa-grafana:
+    image: grafana/grafana:latest
+    container_name: konipa-sage-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - konipa-grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - konipa-prometheus
+    networks:
+      - konipa-network
+    profiles:
+      - monitoring
+
+  # Collecteur de logs avec Fluentd
+  konipa-fluentd:
+    build:
+      context: ./logging
+      dockerfile: Dockerfile.fluentd
+    container_name: konipa-sage-fluentd
+    restart: unless-stopped
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    volumes:
+      - ./logging/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - ./logs:/fluentd/log
+    networks:
+      - konipa-network
+    profiles:
+      - logging
+
+  # Worker pour les tâches asynchrones
+  konipa-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: konipa-sage-worker
+    restart: unless-stopped
+    environment:
+      # Même configuration que l'app principale
+      - NODE_ENV=production
+      - DB_HOST=konipa-db
+      - DB_PORT=3306
+      - DB_NAME=konipa_production
+      - DB_USER=konipa_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_URL=redis://konipa-redis:6379
+      - SAGE_API_BASE_URL=${SAGE_API_BASE_URL}
+      - SAGE_API_KEY=${SAGE_API_KEY}
+      - SAGE_COMPANY_ID=${SAGE_COMPANY_ID}
+      - WORKER_CONCURRENCY=5
+      - WORKER_QUEUE_NAME=sage-sync
+    volumes:
+      - ./logs:/app/logs
+      - ./certs:/app/certs:ro
+    depends_on:
+      - konipa-db
+      - konipa-redis
+    networks:
+      - konipa-network
+      - sage-network
+    profiles:
+      - worker
+
+# Réseaux
+networks:
+  konipa-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  
+  sage-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+# Volumes persistants
+volumes:
+  konipa-db-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/mysql
+      
+  konipa-redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+      
+  konipa-prometheus-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/prometheus
+      
+  konipa-grafana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/grafana
+
+# Configuration des profils
+# Utilisation :
+# docker-compose -f docker-compose.sage.yml up                    # Services de base
+# docker-compose -f docker-compose.sage.yml --profile monitoring up  # Avec monitoring
+# docker-compose -f docker-compose.sage.yml --profile logging up     # Avec logging
+# docker-compose -f docker-compose.sage.yml --profile worker up      # Avec worker
+# docker-compose -f docker-compose.sage.yml --profile all up         # Tous les services

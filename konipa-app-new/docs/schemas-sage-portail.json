@@ -1,0 +1,433 @@
+{
+  "architecture_overview": {
+    "sage_responsibilities": [
+      "Référentiels clients (clientCode, raison sociale, adresses, TVA, contacts)",
+      "Plafonds de crédit, encours, impayés",
+      "Catalogue articles (AR_Ref, désignation, famille, marque, prix de base HT)",
+      "Stocks par entrepôt",
+      "Documents comptables (factures, BL, règlements)",
+      "Création et suivi des bons de commande officiels"
+    ],
+    "portail_responsibilities": [
+      "Utilisateurs web et authentification",
+      "Remises personnalisées par client/article",
+      "Quotas et plafonds par client",
+      "Substituts produits",
+      "Workflow de commandes web",
+      "Consolidation 19h",
+      "Transferts inter-entrepôts",
+      "Notifications et traçabilité",
+      "Analytics et KPI"
+    ]
+  },
+  "database_schemas": {
+    "users": {
+      "description": "Utilisateurs du portail web",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "email": "VARCHAR(255) UNIQUE NOT NULL",
+        "password_hash": "VARCHAR(255) NOT NULL",
+        "role": "ENUM('admin', 'client', 'representative', 'accounting', 'counter') NOT NULL",
+        "is_active": "BOOLEAN DEFAULT true",
+        "first_name": "VARCHAR(100)",
+        "last_name": "VARCHAR(100)",
+        "phone": "VARCHAR(20)",
+        "client_code_sage": "VARCHAR(50) -- Lien vers Sage si role=client",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "last_login": "TIMESTAMP"
+      }
+    },
+    "clients": {
+      "description": "Référentiel clients (sync depuis Sage)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "client_code_sage": "VARCHAR(50) UNIQUE NOT NULL -- Clé Sage",
+        "company_name": "VARCHAR(255) NOT NULL",
+        "vat_number": "VARCHAR(50)",
+        "address_line1": "VARCHAR(255)",
+        "address_line2": "VARCHAR(255)",
+        "city": "VARCHAR(100)",
+        "postal_code": "VARCHAR(20)",
+        "country": "VARCHAR(100)",
+        "credit_limit": "DECIMAL(15,2) -- Cache depuis Sage",
+        "outstanding_amount": "DECIMAL(15,2) -- Cache depuis Sage",
+        "is_blocked": "BOOLEAN DEFAULT false -- Cache depuis Sage",
+        "representative_id": "UUID REFERENCES users(id)",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "last_sync_sage": "TIMESTAMP"
+      }
+    },
+    "products": {
+      "description": "Catalogue produits (sync depuis Sage)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "product_ref_sage": "VARCHAR(50) UNIQUE NOT NULL -- AR_Ref Sage",
+        "name": "VARCHAR(255) NOT NULL",
+        "description": "TEXT",
+        "base_price_ht": "DECIMAL(10,2) NOT NULL -- Prix de base depuis Sage",
+        "brand_id": "UUID REFERENCES brands(id)",
+        "category_id": "UUID REFERENCES categories(id)",
+        "image_url": "VARCHAR(500)",
+        "is_active": "BOOLEAN DEFAULT true",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "last_sync_sage": "TIMESTAMP"
+      }
+    },
+    "product_stocks": {
+      "description": "Stocks par entrepôt (cache depuis Sage)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "product_id": "UUID REFERENCES products(id)",
+        "warehouse_code_sage": "VARCHAR(50) NOT NULL -- Code dépôt Sage",
+        "quantity_available": "DECIMAL(10,2) NOT NULL",
+        "quantity_reserved": "DECIMAL(10,2) DEFAULT 0",
+        "last_sync_sage": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "UNIQUE(product_id, warehouse_code_sage)": ""
+      }
+    },
+    "product_substitutes": {
+      "description": "Substituts produits (gestion portail)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "product_id": "UUID REFERENCES products(id)",
+        "substitute_id": "UUID REFERENCES products(id)",
+        "rank": "INTEGER NOT NULL -- Ordre de priorité 1-5",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "UNIQUE(product_id, substitute_id)": ""
+      }
+    },
+    "price_overrides": {
+      "description": "Remises personnalisées (gestion portail)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "client_id": "UUID REFERENCES clients(id)",
+        "product_id": "UUID REFERENCES products(id) -- NULL = remise par famille",
+        "category_id": "UUID REFERENCES categories(id) -- NULL = remise produit spécifique",
+        "discount_percent": "DECIMAL(5,2) NOT NULL -- Ex: 15.50 pour 15.5%",
+        "valid_from": "DATE",
+        "valid_until": "DATE",
+        "is_active": "BOOLEAN DEFAULT true",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "created_by": "UUID REFERENCES users(id)"
+      }
+    },
+    "quotas": {
+      "description": "Quotas client/produit (gestion portail)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "client_id": "UUID REFERENCES clients(id)",
+        "product_id": "UUID REFERENCES products(id)",
+        "period_type": "ENUM('daily', 'weekly', 'monthly', 'yearly') NOT NULL",
+        "period_start": "DATE NOT NULL",
+        "period_end": "DATE NOT NULL",
+        "quantity_limit": "DECIMAL(10,2) NOT NULL",
+        "quantity_used": "DECIMAL(10,2) DEFAULT 0",
+        "is_active": "BOOLEAN DEFAULT true",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    },
+    "orders": {
+      "description": "Commandes portail web",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "order_number": "VARCHAR(50) UNIQUE NOT NULL -- Numéro portail",
+        "client_id": "UUID REFERENCES clients(id)",
+        "placed_by_user_id": "UUID REFERENCES users(id)",
+        "status_web": "ENUM('DRAFT', 'SUBMITTED', 'VALIDATED', 'PREPARATION', 'READY', 'SHIPPED', 'DELIVERED', 'REFUSED') NOT NULL",
+        "sage_order_number": "VARCHAR(50) -- Numéro BC Sage après validation",
+        "transporter": "VARCHAR(100)",
+        "payment_mode": "ENUM('EN_COMPTE', 'CASH', 'CARD') DEFAULT 'EN_COMPTE'",
+        "total_ht": "DECIMAL(15,2) NOT NULL",
+        "total_ttc": "DECIMAL(15,2) NOT NULL",
+        "delivery_address": "TEXT",
+        "notes": "TEXT",
+        "validated_by": "UUID REFERENCES users(id) -- Qui a validé côté compta",
+        "validated_at": "TIMESTAMP",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    },
+    "order_items": {
+      "description": "Lignes de commande",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "order_id": "UUID REFERENCES orders(id)",
+        "product_id": "UUID REFERENCES products(id)",
+        "quantity": "DECIMAL(10,2) NOT NULL",
+        "unit_price_ht": "DECIMAL(10,2) NOT NULL -- Prix de base Sage",
+        "discount_percent": "DECIMAL(5,2) DEFAULT 0 -- Remise appliquée",
+        "line_total_ht": "DECIMAL(15,2) NOT NULL -- Calculé par portail",
+        "warehouse_code_sage": "VARCHAR(50) -- Entrepôt de livraison",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    },
+    "grouped_orders": {
+      "description": "Consolidation 19h (optionnel)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "client_id": "UUID REFERENCES clients(id)",
+        "consolidation_date": "DATE NOT NULL",
+        "status": "ENUM('PENDING', 'CONSOLIDATED', 'SENT_TO_SAGE') NOT NULL",
+        "sage_order_number": "VARCHAR(50)",
+        "total_orders": "INTEGER NOT NULL",
+        "total_amount_ht": "DECIMAL(15,2) NOT NULL",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    },
+    "transfer_requests": {
+      "description": "Demandes de transfert inter-entrepôts",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "from_warehouse_code": "VARCHAR(50) NOT NULL",
+        "to_warehouse_code": "VARCHAR(50) NOT NULL",
+        "product_id": "UUID REFERENCES products(id)",
+        "quantity": "DECIMAL(10,2) NOT NULL",
+        "status": "ENUM('REQUESTED', 'APPROVED', 'IN_TRANSIT', 'COMPLETED', 'REFUSED') NOT NULL",
+        "order_id": "UUID REFERENCES orders(id) -- Commande à l'origine",
+        "requested_by": "UUID REFERENCES users(id)",
+        "approved_by": "UUID REFERENCES users(id)",
+        "reason": "TEXT",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "completed_at": "TIMESTAMP"
+      }
+    },
+    "documents": {
+      "description": "Documents comptables (liens vers Sage)",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "client_id": "UUID REFERENCES clients(id)",
+        "document_type": "ENUM('INVOICE', 'DELIVERY_NOTE', 'PAYMENT') NOT NULL",
+        "sage_document_number": "VARCHAR(50) NOT NULL",
+        "document_date": "DATE NOT NULL",
+        "amount_ttc": "DECIMAL(15,2)",
+        "payment_status": "ENUM('PENDING', 'PAID', 'OVERDUE')",
+        "pdf_url": "VARCHAR(500) -- URL Sage ou cache local",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "last_sync_sage": "TIMESTAMP"
+      }
+    },
+    "notifications": {
+      "description": "Journal des notifications envoyées",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "recipient_type": "ENUM('USER', 'CLIENT') NOT NULL",
+        "recipient_id": "UUID NOT NULL -- user_id ou client_id",
+        "channel": "ENUM('EMAIL', 'SMS', 'WHATSAPP', 'WEB') NOT NULL",
+        "template": "VARCHAR(100) NOT NULL",
+        "subject": "VARCHAR(255)",
+        "content": "TEXT NOT NULL",
+        "status": "ENUM('PENDING', 'SENT', 'DELIVERED', 'FAILED') NOT NULL",
+        "cost": "DECIMAL(8,4) -- Coût SMS/WhatsApp",
+        "sent_at": "TIMESTAMP",
+        "delivered_at": "TIMESTAMP",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    },
+    "audit_logs": {
+      "description": "Journal d'audit des actions",
+      "fields": {
+        "id": "UUID PRIMARY KEY",
+        "actor_user_id": "UUID REFERENCES users(id)",
+        "action": "VARCHAR(100) NOT NULL -- CREATE, UPDATE, DELETE, VALIDATE, etc.",
+        "entity_type": "VARCHAR(50) NOT NULL -- orders, users, products, etc.",
+        "entity_id": "UUID NOT NULL",
+        "old_values": "JSONB -- État avant",
+        "new_values": "JSONB -- État après",
+        "ip_address": "INET",
+        "user_agent": "TEXT",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+      }
+    }
+  },
+  "sage_api_contracts": {
+    "description": "Contrats d'API pour intégration Sage (mockés en dev)",
+    "read_endpoints": {
+      "GET /sync/catalog/full": {
+        "description": "Récupération complète du catalogue",
+        "response": {
+          "products": [
+            {
+              "productRef": "AR001",
+              "name": "Produit exemple",
+              "description": "Description",
+              "basePriceHT": 100.00,
+              "brand": "Marque",
+              "category": "Catégorie",
+              "isActive": true
+            }
+          ]
+        }
+      },
+      "GET /sync/products/:ref/stock": {
+        "description": "Stock par entrepôt pour un produit",
+        "response": {
+          "productRef": "AR001",
+          "stocks": [
+            {
+              "warehouseCode": "DEP01",
+              "quantityAvailable": 150.0,
+              "quantityReserved": 25.0
+            }
+          ]
+        }
+      },
+      "GET /sync/clients/:clientCode": {
+        "description": "Détails client",
+        "response": {
+          "clientCode": "CLI001",
+          "companyName": "Société exemple",
+          "vatNumber": "FR123456789",
+          "address": {
+            "line1": "123 Rue Example",
+            "city": "Paris",
+            "postalCode": "75001",
+            "country": "France"
+          },
+          "contacts": [
+            {
+              "name": "Contact Principal",
+              "email": "contact@exemple.fr",
+              "phone": "+33123456789"
+            }
+          ]
+        }
+      },
+      "GET /sync/financial-status/:clientCode": {
+        "description": "État financier client",
+        "response": {
+          "clientCode": "CLI001",
+          "creditLimit": 50000.00,
+          "outstandingAmount": 12500.00,
+          "overdueAmount": 0.00,
+          "isBlocked": false,
+          "lastPaymentDate": "2024-01-15"
+        }
+      },
+      "GET /sync/invoices": {
+        "description": "Liste des factures client",
+        "params": "?clientCode=CLI001&limit=50&offset=0",
+        "response": {
+          "invoices": [
+            {
+              "documentId": "FAC-2024-001",
+              "documentNumber": "F240001",
+              "date": "2024-01-15",
+              "amountTTC": 1200.00,
+              "paymentStatus": "PAID",
+              "dueDate": "2024-02-15"
+            }
+          ],
+          "total": 125,
+          "hasMore": true
+        }
+      },
+      "GET /sync/document/:id/pdf": {
+        "description": "Téléchargement PDF document",
+        "response": "Binary PDF content"
+      }
+    },
+    "write_endpoints": {
+      "POST /sync/sales-orders": {
+        "description": "Création bon de commande Sage",
+        "request": {
+          "clientCode": "CLI001",
+          "lines": [
+            {
+              "productRef": "AR001",
+              "quantity": 10.0,
+              "unitPriceHT": 95.00,
+              "warehouseCode": "DEP01"
+            }
+          ],
+          "transporter": "TRANSPORTEUR_1",
+          "paymentMode": "EN_COMPTE",
+          "deliveryAddress": "Adresse de livraison",
+          "approvedBy": "user@exemple.fr",
+          "notes": "Commentaires"
+        },
+        "response": {
+          "success": true,
+          "sageOrderNumber": "BC-2024-001",
+          "estimatedDelivery": "2024-01-20"
+        }
+      },
+      "POST /sync/orders/:sageOrderNumber/status": {
+        "description": "Mise à jour statut commande",
+        "request": {
+          "status": "SHIPPED",
+          "trackingNumber": "TRK123456789",
+          "updatedBy": "user@exemple.fr"
+        },
+        "response": {
+          "success": true,
+          "updatedAt": "2024-01-18T10:30:00Z"
+        }
+      }
+    }
+  },
+  "mock_implementation": {
+    "description": "Implémentation mock pour le développement",
+    "environment_flag": "USE_SAGE_MOCK=true|false",
+    "mock_features": [
+      "Génération de sageOrderNumber fictifs (BC-YYYY-NNNN)",
+      "Simulation des délais de réponse Sage",
+      "Calcul automatique des états financiers depuis la DB portail",
+      "Génération de PDF placeholder pour les documents",
+      "Simulation des erreurs Sage (timeouts, indisponibilité)"
+    ],
+    "data_seeding": {
+      "clients_sample": "50 clients avec codes CLI001-CLI050",
+      "products_sample": "200 produits avec références AR001-AR200",
+      "financial_data": "Plafonds et encours réalistes",
+      "stock_data": "Stocks aléatoires sur 3 entrepôts (DEP01, DEP02, DEP03)"
+    }
+  },
+  "migration_priorities": {
+    "phase_1_core": [
+      "users",
+      "clients",
+      "products",
+      "orders",
+      "order_items"
+    ],
+    "phase_2_business_logic": [
+      "price_overrides",
+      "quotas",
+      "product_substitutes",
+      "product_stocks"
+    ],
+    "phase_3_advanced": [
+      "transfer_requests",
+      "grouped_orders",
+      "documents",
+      "notifications",
+      "audit_logs"
+    ]
+  },
+  "sage_integration_checklist": {
+    "development": [
+      "✓ Implémenter MockSageApiService avec tous les endpoints",
+      "✓ Créer les migrations de base de données",
+      "✓ Seeder les données de test",
+      "✓ Tester tous les workflows avec le mock",
+      "✓ Valider les calculs de prix et remises"
+    ],
+    "pre_production": [
+      "□ Obtenir les spécifications techniques Sage du client",
+      "□ Configurer l'accès aux web services Sage",
+      "□ Mapper les codes clients/produits réels",
+      "□ Tester la connexion Sage en lecture",
+      "□ Valider la création de BC test"
+    ],
+    "production": [
+      "□ Basculer USE_SAGE_MOCK=false",
+      "□ Synchronisation initiale complète",
+      "□ Tests de charge sur les APIs Sage",
+      "□ Monitoring des erreurs d'intégration",
+      "□ Formation utilisateurs sur les nouveaux workflows"
+    ]
+  }
+}

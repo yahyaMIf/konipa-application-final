@@ -1,0 +1,26 @@
+{
+  "development": {
+    "username": "konipa_user",
+    "password": "konipa_password",
+    "database": "konipa_db",
+    "host": "localhost",
+    "port": 5432,
+    "dialect": "postgres"
+  },
+  "test": {
+    "username": "konipa_user",
+    "password": "konipa_password",
+    "database": "konipa_db_test",
+    "host": "localhost",
+    "port": 5432,
+    "dialect": "postgres"
+  },
+  "production": {
+    "username": "konipa_user",
+    "password": "konipa_password",
+    "database": "konipa_db",
+    "host": "localhost",
+    "port": 5432,
+    "dialect": "postgres"
+  }
+}
